@@ -8,7 +8,7 @@ import EventEmitter from './EventEmitter';
 import LocalConferenceDescription from '../Calls/LocalConferenceDescription';
 import StreamManager from '../Calls/StreamManager';
 import { canManageVoiceChats, getChatTitle } from '../Utils/Chat';
-import { closeGroupCallPanel } from '../Actions/Call';
+import { closeCallPanel, closeGroupCallPanel, openCallPanel } from '../Actions/Call';
 import { getUserFullName } from '../Utils/User';
 import { fromTelegramSource, getStream, getTransport, parseSdp, toTelegramSource } from '../Calls/Utils';
 import { showAlert, showLeaveVoiceChatAlert } from '../Actions/Client';
@@ -52,9 +52,12 @@ class CallStore extends EventEmitter {
 
     reset = () => {
         this.currentGroupCall = null;
+        this.groupItems = new Map();
         this.items = new Map();
+
         this.participants = new Map();
-        this.panelOpened = false;
+        this.groupCallPanelOpened = false;
+        this.callPanelOpened = false;
         this.animated = true;
     };
 
@@ -86,21 +89,43 @@ class CallStore extends EventEmitter {
                 break;
             }
             case 'updateCall': {
-                LOG_CALL('[update] updateCall', update);
-                if (this.p2pCallsEnabled) {
-                    const { call } = update;
-                    if (call) {
-                        const { id, state, is_outgoing } = call;
+                LOG_P2P_CALL('[update] updateCall', update);
+                const { call } = update;
 
+                const { id, state, is_outgoing } = call;
+                const prevCall = this.p2pGet(id)
+                this.p2pSet(call);
+
+                if (this.p2pCallsEnabled) {
+                    if (call) {
                         switch (state['@type']) {
+                            case 'callStateDiscarded': {
+                                // if (!is_outgoing) {
+                                    closeCallPanel();
+                                // }
+                                this.p2pHangUp(id);
+                                break;
+                            }
+                            case 'callStateError': {
+                                closeCallPanel();
+                                this.p2pHangUp(id);
+                                break;
+                            }
+                            case 'callStateExchangingKeys': {
+                                break;
+                            }
+                            case 'callStateHangingUp': {
+                                break;
+                            }
                             case 'callStatePending': {
-                                if (!is_outgoing) {
-                                    this.p2pAcceptCall(id);
-                                }
+                                openCallPanel(id);
                                 break;
                             }
                             case 'callStateReady': {
-                                this.p2pSendCallSignalingData(id, 'Hello world!');
+                                if (prevCall && prevCall.state['@type'] !== 'callStateReady') {
+                                    this.p2pJoinCall(id);
+                                }
+
                                 break;
                             }
                         }
@@ -185,8 +210,17 @@ class CallStore extends EventEmitter {
                 break;
             }
             case 'updateNewCallSignalingData': {
-                const { data } = update;
-                LOG_CALL('[update] updateNewCallSignalingData', update, atob(data));
+                const { call_id, data } = update;
+
+                try {
+                    const signalingData = JSON.parse(atob(data));
+                    LOG_P2P_CALL('[update] updateNewCallSignalingData', update, signalingData);
+                    if (this.p2pCallsEnabled) {
+                        this.p2pApplyCallSignalingData(call_id, signalingData);
+                    }
+                } catch (e) {
+                    ERROR_P2P_CALL('[update] updateNewSignalingData parse', update);
+                }
 
                 this.emit('updateNewCallSignalingData', update);
                 break;
@@ -201,7 +235,7 @@ class CallStore extends EventEmitter {
             case 'clientUpdateGroupCall': {
                 this.currentGroupCall = update.call;
 
-                if (this.panelOpened && !this.currentGroupCall) {
+                if (this.groupCallPanelOpened && !this.currentGroupCall) {
                     closeGroupCallPanel();
                 }
 
@@ -276,8 +310,13 @@ class CallStore extends EventEmitter {
                 break;
             }
             case 'clientUpdateGroupCallPanel': {
-                this.panelOpened = update.opened;
+                this.groupCallPanelOpened = update.opened;
                 this.emit('clientUpdateGroupCallPanel', update);
+                break;
+            }
+            case 'clientUpdateCallPanel': {
+                this.callPanelOpened = update.opened;
+                this.emit('clientUpdateCallPanel', update);
                 break;
             }
             default:
@@ -300,11 +339,11 @@ class CallStore extends EventEmitter {
     }
 
     get(callId) {
-        return this.items.get(callId);
+        return this.groupItems.get(callId);
     }
 
     set(call) {
-        this.items.set(call.id, call);
+        this.groupItems.set(call.id, call);
     }
 
     playSound(sound) {
@@ -1030,11 +1069,20 @@ class CallStore extends EventEmitter {
     replaceOutputDevice(deviceId) {
         if (JOIN_TRACKS) {
             const player = document.getElementById('group-call-player');
-            if (!player) return;
+            if (player) {
+                for (let audio of player.getElementsByTagName('audio')) {
+                    if (typeof audio.sinkId !== 'undefined') {
+                        audio.setSinkId(deviceId);
+                    }
+                }
+            }
 
-            for (let audio of player.getElementsByTagName('audio')) {
-                if (typeof audio.sinkId !== 'undefined') {
-                    audio.setSinkId(deviceId);
+            const p2pPlayer = document.getElementById('call-output-video');
+            if (p2pPlayer) {
+                for (let audio of p2pPlayer.getElementsByTagName('audio')) {
+                    if (typeof audio.sinkId !== 'undefined') {
+                        audio.setSinkId(deviceId);
+                    }
                 }
             }
         } else {
@@ -1050,10 +1098,12 @@ class CallStore extends EventEmitter {
     }
 
     setOutputDeviceId(deviceId) {
-        const { currentGroupCall } = this;
-        if (!currentGroupCall) return;
-
-        currentGroupCall.outputDeviceId = deviceId;
+        const { currentGroupCall, currentCall } = this;
+        if (currentGroupCall) {
+            currentGroupCall.outputDeviceId = deviceId;
+        } else if (currentCall) {
+            currentCall.outputDeviceId = deviceId;
+        }
 
         this.replaceOutputDevice(deviceId);
     }
@@ -1064,11 +1114,20 @@ class CallStore extends EventEmitter {
 
         if (JOIN_TRACKS) {
             const player = document.getElementById('group-call-player');
-            if (!player) return null;
+            if (player) {
+                for (let audio of player.getElementsByTagName('audio')) {
+                    if (typeof audio.sinkId !== 'undefined') {
+                        return audio.sinkId;
+                    }
+                }
+            }
 
-            for (let audio of player.getElementsByTagName('audio')) {
-                if (typeof audio.sinkId !== 'undefined') {
-                    return audio.sinkId;
+            const p2pPlayer = document.getElementById('call-output-video');
+            if (p2pPlayer) {
+                for (let audio of p2pPlayer.getElementsByTagName('audio')) {
+                    if (typeof audio.sinkId !== 'undefined') {
+                        return audio.sinkId;
+                    }
                 }
             }
         } else {
@@ -1086,43 +1145,128 @@ class CallStore extends EventEmitter {
     }
 
     async replaceInputAudioDevice(stream) {
-        const { currentGroupCall } = this;
-        if (!currentGroupCall) return;
+        const { currentGroupCall, currentCall } = this;
+        if (currentGroupCall) {
+            const { connection, streamManager } = currentGroupCall;
+            if (!connection) return;
 
-        const { connection, streamManager } = currentGroupCall;
-        if (!connection) return;
+            const { inputStream } = streamManager;
 
-        const { inputStream } = streamManager;
+            // const videoTrack = stream.getVideoTracks()[0];
+            // const sender = pc.getSenders().find(function(s) {
+            //     return s.track.kind == videoTrack.kind;
+            // });
+            // sender.replaceTrack(videoTrack);
 
-        // const videoTrack = stream.getVideoTracks()[0];
-        // const sender = pc.getSenders().find(function(s) {
-        //     return s.track.kind == videoTrack.kind;
-        // });
-        // sender.replaceTrack(videoTrack);
+            const audioTrack = stream.getAudioTracks()[0];
+            const sender2 = connection.getSenders().find(x => {
+                return x.track.kind === audioTrack.kind;
+            });
+            const oldTrack = sender2.track;
+            await sender2.replaceTrack(audioTrack);
 
-        const audioTrack = stream.getAudioTracks()[0];
-        const sender2 = connection.getSenders().find(x => {
-            return x.track.kind === audioTrack.kind;
-        });
-        const oldTrack = sender2.track;
-        await sender2.replaceTrack(audioTrack);
+            oldTrack.stop();
+            streamManager.replaceInputAudio(stream, oldTrack);
+        } else if (currentCall) {
+            // const { connection, streamManager } = currentGroupCall;
+            // if (!connection) return;
+            //
+            // const { inputStream } = streamManager;
+            //
+            // // const videoTrack = stream.getVideoTracks()[0];
+            // // const sender = pc.getSenders().find(function(s) {
+            // //     return s.track.kind == videoTrack.kind;
+            // // });
+            // // sender.replaceTrack(videoTrack);
+            //
+            // const audioTrack = stream.getAudioTracks()[0];
+            // const sender2 = connection.getSenders().find(x => {
+            //     return x.track.kind === audioTrack.kind;
+            // });
+            // const oldTrack = sender2.track;
+            // await sender2.replaceTrack(audioTrack);
+            //
+            // oldTrack.stop();
+            // streamManager.replaceInputAudio(stream, oldTrack);
+        }
+    }
 
-        oldTrack.stop();
-        streamManager.replaceInputAudio(stream, oldTrack);
+    async replaceInputVideoDevice(stream) {
+        const { currentGroupCall, currentCall } = this;
+        if (currentGroupCall) {
+            // const { connection, streamManager } = currentGroupCall;
+            // if (!connection) return;
+            //
+            // const { inputStream } = streamManager;
+            //
+            // // const videoTrack = stream.getVideoTracks()[0];
+            // // const sender = pc.getSenders().find(function(s) {
+            // //     return s.track.kind == videoTrack.kind;
+            // // });
+            // // sender.replaceTrack(videoTrack);
+            //
+            // const audioTrack = stream.getAudioTracks()[0];
+            // const sender2 = connection.getSenders().find(x => {
+            //     return x.track.kind === audioTrack.kind;
+            // });
+            // const oldTrack = sender2.track;
+            // await sender2.replaceTrack(audioTrack);
+            //
+            // oldTrack.stop();
+            // streamManager.replaceInputAudio(stream, oldTrack);
+        } else if (currentCall) {
+            const { connection, inputStream } = currentCall;
+            if (!connection) return;
+
+            const videoTrack = stream.getVideoTracks()[0];
+            const sender = connection.getSenders().find(function(s) {
+                return s.track.kind == videoTrack.kind;
+            });
+            const oldTrack = sender.track;
+            sender.replaceTrack(videoTrack);
+
+            oldTrack.stop();
+            // inputStream.replaceTrack()
+
+            // const audioTrack = stream.getAudioTracks()[0];
+            // const sender2 = connection.getSenders().find(x => {
+            //     return x.track.kind === audioTrack.kind;
+            // });
+            // const oldTrack = sender2.track;
+            // await sender2.replaceTrack(audioTrack);
+
+            // oldTrack.stop();
+            // streamManager.replaceInputAudio(stream, oldTrack);
+        }
     }
 
     async setInputAudioDeviceId(deviceId, stream) {
-        const { currentGroupCall } = this;
-        if (!currentGroupCall) return;
+        const { currentGroupCall, currentCall } = this;
+        if (currentGroupCall) {
+            await this.replaceInputAudioDevice(stream);
+        } else if (currentCall) {
+            await this.replaceInputAudioDevice(stream);
+        }
+    }
 
-        await this.replaceInputAudioDevice(stream);
+    async setInputVideoDeviceId(deviceId, stream) {
+        const { currentGroupCall, currentCall } = this;
+        if (currentGroupCall) {
+            await this.replaceInputVideoDevice(stream);
+        } else if (currentCall) {
+            await this.replaceInputVideoDevice(stream);
+        }
     }
 
     getInputAudioDeviceId() {
-        const { currentGroupCall } = this;
-        if (!currentGroupCall) return null;
+        const { currentGroupCall, currentCall } = this;
 
-        const { connection } = currentGroupCall;
+        let connection = null;
+        if (currentGroupCall) {
+            connection = currentGroupCall.connection;
+        } else if (currentCall) {
+            connection = currentCall.connection;
+        }
         if (!connection) return null;
 
         let deviceId = null
@@ -1140,10 +1284,14 @@ class CallStore extends EventEmitter {
     }
 
     getInputVideoDeviceId() {
-        const { currentGroupCall } = this;
-        if (!currentGroupCall) return null;
+        const { currentGroupCall, currentCall } = this;
 
-        const { connection } = currentGroupCall;
+        let connection = null;
+        if (currentGroupCall) {
+            connection = currentGroupCall.connection;
+        } else if (currentCall) {
+            connection = currentCall.connection;
+        }
         if (!connection) return null;
 
         let deviceId = null
@@ -1256,6 +1404,14 @@ class CallStore extends EventEmitter {
         });
     }
 
+    p2pGet(callId) {
+        return this.items.get(callId);
+    }
+
+    p2pSet(call) {
+        this.items.set(call.id, call);
+    }
+
     get p2pCallsEnabled() {
         return TdLibController.calls;
     }
@@ -1267,7 +1423,7 @@ class CallStore extends EventEmitter {
             udp_reflector: true,
             min_layer: 126,
             max_layer: 126,
-            library_versions: []
+            library_versions: ['3.0.0']
         };
     }
 
@@ -1311,13 +1467,421 @@ class CallStore extends EventEmitter {
     }
 
     p2pSendCallSignalingData(callId, data) {
-        LOG_P2P_CALL('p2pSendCallSignalingData', callId, data);
-
         LOG_P2P_CALL('[tdlib] sendCallSignalingData', callId, data);
         TdLibController.send({
             '@type': 'sendCallSignalingData',
             call_id: callId,
             data: btoa(data)
+        });
+    }
+
+    p2pGetConfiguration(state){
+        if (!state) return null;
+
+        const { servers, allow_p2p } = state;
+
+        const iceServers = [];
+        servers.forEach(x => {
+            const { ip_address, ipv6_address, port, type } = x;
+            switch (type['@type']) {
+                case 'callServerTypeTelegramReflector': {
+                    break;
+                }
+                case 'callServerTypeWebrtc': {
+                    const { username, password: credential, supports_turn, supports_stun } = type;
+                    const urls = [];
+                    if (supports_turn) {
+                        if (ip_address) {
+                            urls.push(`turn:${ip_address}:${port}`);
+                        }
+                        if (ipv6_address) {
+                            urls.push(`turn:[${ipv6_address}]:${port}`);
+                        }
+
+                    } else if (supports_stun) {
+                        if (ip_address) {
+                            urls.push(`stun:${ip_address}:${port}`);
+                        }
+                        if (ipv6_address) {
+                            urls.push(`stun:[${ipv6_address}]:${port}`);
+                        }
+                    }
+
+                    if (urls.length > 0) {
+                        iceServers.push({
+                            urls,
+                            username,
+                            credential
+                        });
+                    }
+                    break;
+                }
+            }
+        });
+
+        return {
+            iceServers,
+            iceTransportPolicy: allow_p2p ? 'all' : 'relay'
+        };
+    }
+
+    async p2pJoinCall(callId) {
+        LOG_P2P_CALL('p2pJoinCall', callId);
+        const call = this.p2pGet(callId);
+        if (!call) return;
+
+        const { id, state, is_outgoing } = call;
+        if (!state) return;
+        if (state['@type'] !== 'callStateReady') return;
+
+        const outputStream = new MediaStream();
+
+        const configuration = this.p2pGetConfiguration(state);
+        LOG_P2P_CALL('p2pJoinCall configuration', configuration);
+        if (!configuration) return;
+
+        const connection = new RTCPeerConnection(configuration);
+        connection.oniceconnectionstatechange = event => {
+            LOG_P2P_CALL('[conn] oniceconnectionstatechange', connection.iceConnectionState);
+        };
+        connection.onnegotiationneeded = event => {
+            LOG_P2P_CALL('[conn] onnegotiationneeded', connection.signalingState);
+            this.p2pStartNegotiation(id);
+        }
+        connection.onicecandidate = event => {
+            const { candidate } = event;
+            LOG_P2P_CALL('[conn] onicecandidate', candidate);
+            if (candidate && candidate.candidate) {
+                this.p2pSendIceCandidate(id, candidate);
+            }
+        };
+        connection.ontrack = event => {
+            const { track } = event;
+            LOG_P2P_CALL('[conn] ontrack', track);
+            outputStream.addTrack(track);
+            const video = document.getElementById('call-output-video');
+            if (video) {
+                video.srcObject = outputStream;
+            }
+        };
+
+        this.currentCall = {
+            callId: id,
+            connection,
+            inputStream: null,
+            outputStream
+        };
+        LOG_P2P_CALL('p2pJoinCall currentCall', this.currentCall);
+
+        const inputStream = await navigator.mediaDevices.getUserMedia({
+            // video: {
+            //     width: { min: 270, max: 270 },
+            //     height: { min: 480, max: 480},
+            // },
+            video: true,
+            audio: true
+        });
+        this.currentCall.inputStream = inputStream;
+
+        const inputVideo = document.getElementById('call-input-video');
+        if (inputVideo) {
+            inputVideo.srcObject = inputStream;
+        }
+
+        if (is_outgoing) {
+            this.p2pAppendInputStream(inputStream);
+            // this.p2pStartNegotiation(id);
+        } else {
+            LOG_P2P_CALL('try invoke p2pAppendInputStream', connection.localDescription, connection.remoteDescription);
+            if (connection.localDescription && connection.remoteDescription) {
+                this.p2pAppendInputStream(inputStream);
+            }
+        }
+    }
+
+    /// https://developer.mozilla.org/en-US/docs/Web/API/WebRTC_API/Perfect_negotiation
+    p2pStartNegotiation = async id => {
+        const { currentCall } = this;
+        LOG_P2P_CALL('p2pStartNegotiation', currentCall);
+        if (!currentCall) return;
+
+        const { callId, connection } = currentCall;
+        if (callId !== id) return;
+        if (!connection) return;
+
+        const call = this.p2pGet(callId)
+        if (!call) return;
+
+        // const { is_outgoing } = call;
+        // if (!is_outgoing) return;
+
+        const offer = await connection.createOffer({
+            offerToReceiveAudio: true,
+            offerToReceiveVideo: true
+        });
+
+        await connection.setLocalDescription(offer);
+        this.p2pSendOffer(callId, offer);
+    };
+
+    p2pAppendInputStream(inputStream) {
+        LOG_P2P_CALL('p2pAppendInputStream start', inputStream);
+        const { currentCall } = this;
+        if (!currentCall) return;
+
+        const { connection } = currentCall;
+        if (!connection) return;
+
+        const senders = connection.getSenders();
+        if (senders.some(x => x.track)) return;
+
+        inputStream && inputStream.getTracks().forEach(x => {
+            connection.addTrack(x, inputStream);
+        });
+        LOG_P2P_CALL('p2pAppendInputStream stop', inputStream);
+    }
+
+    async p2pApplyCallSignalingData(callId, signalingData) {
+        if (!signalingData) return;
+
+        const { currentCall } = this;
+        LOG_P2P_CALL('p2pApplyCallSignalingData', currentCall, signalingData);
+        if (!currentCall) {
+            ERROR_P2P_CALL('p2pApplyCallSignalingData 0');
+            return;
+        }
+        if (currentCall.callId !== callId) {
+            ERROR_P2P_CALL('p2pApplyCallSignalingData 1');
+            return;
+        }
+
+        const { connection } = currentCall;
+        if (!connection) {
+            ERROR_P2P_CALL('p2pApplyCallSignalingData 2');
+            return;
+        }
+
+        const call = this.p2pGet(callId);
+        if (!call) {
+            return;
+        }
+
+        const { is_outgoing } = call;
+
+        const { type, data } = signalingData;
+        switch (type) {
+            case 'answer':
+            case 'offer':{
+                await connection.setRemoteDescription(signalingData);
+                if (currentCall.candidates) {
+                    currentCall.candidates.forEach(x => {
+                        connection.addIceCandidate(x);
+                    });
+                    currentCall.candidates = [];
+                }
+
+                if (type === 'offer') {
+                    const answer = await connection.createAnswer();
+                    await connection.setLocalDescription(answer);
+
+                    LOG_P2P_CALL('2 try invoke p2pAppendInputStream', inputStream, is_outgoing);
+                    const { inputStream } = currentCall;
+                    if (inputStream && !is_outgoing) {
+                        this.p2pAppendInputStream(inputStream);
+                    }
+
+                    this.p2pSendAnswer(callId, answer);
+                }
+                break;
+            }
+            case 'candidate': {
+                const candidate = new RTCIceCandidate(data);
+                if (candidate.candidate) {
+                    if (!connection.remoteDescription) {
+                        currentCall.candidates = currentCall.candidates || [];
+                        currentCall.candidates.push(candidate);
+                    } else {
+                        await connection.addIceCandidate(candidate);
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    p2pSendIceCandidate(callId, candidate) {
+        LOG_P2P_CALL('p2pSendIceCandidate', callId, candidate);
+        this.p2pSendCallSignalingData(callId, JSON.stringify({ type: 'candidate', data: candidate.toJSON() }));
+    }
+
+    p2pSendDescription(callId, description) {
+        LOG_P2P_CALL('p2pSendDescription', callId, description);
+        this.p2pSendCallSignalingData(callId, JSON.stringify(description));
+    }
+
+    p2pSendOffer(callId, offer) {
+        LOG_P2P_CALL('p2pSendOffer', callId, offer);
+        this.p2pSendCallSignalingData(callId, JSON.stringify(offer));
+        // this.p2pSendCallSignalingData(callId, JSON.stringify({ type: 'offer', data: offer }));
+    }
+
+    p2pSendAnswer(callId, answer) {
+        LOG_P2P_CALL('p2pSendAnswer', callId, answer);
+        this.p2pSendCallSignalingData(callId, JSON.stringify(answer));
+        // this.p2pSendCallSignalingData(callId, JSON.stringify({ type: 'answer', data: answer }));
+    }
+
+    p2pHangUp(callId) {
+        LOG_P2P_CALL('hangUp', callId);
+        const { currentCall } = this;
+        if (!currentCall) return;
+        if (currentCall.callId !== callId) return;
+
+        const call = this.get(callId);
+        if (call) return;
+
+        const { connection, inputStream, outputStream, screenStream } = currentCall;
+        this.p2pCloseConnectionAndStream(connection, inputStream, outputStream, screenStream);
+
+        this.currentCall = null;
+    }
+
+    async p2pStartScreenSharing() {
+        const { currentCall } = this;
+        if (!currentCall) return;
+
+        const { connection } = currentCall;
+        if (!connection) return;
+
+        const options = {
+            video: { cursor: 'always' },
+            audio: false
+        };
+
+        const screenStream = await navigator.mediaDevices.getDisplayMedia(options);
+
+        let replaced = false;
+        connection.getSenders().forEach(x => {
+            if (x.track.kind === 'video') {
+                x.replaceTrack(screenStream.getVideoTracks()[0]);
+                replaced = true;
+            }
+        });
+        if (!replaced) {
+            connection.addTrack(screenStream.getVideoTracks()[0], screenStream);
+        }
+
+        const inputVideo = document.getElementById('call-input-video');
+        if (inputVideo) {
+            inputVideo.srcObject = screenStream;
+        }
+
+        currentCall.screenStream = screenStream;
+    }
+
+    async p2pStopScreenSharing() {
+        const { currentCall } = this;
+        if (!currentCall) return;
+
+        const { connection, inputStream, screenStream } = currentCall;
+        if (!connection) return;
+        if (!screenStream) return;
+
+        const videoTracks = inputStream.getVideoTracks();
+        if (videoTracks.length > 0)
+
+        connection.getSenders().forEach(x => {
+            if (x.track.kind === 'video') {
+                if (videoTracks.length > 0) {
+                    x.replaceTrack(videoTracks[0]);
+                } else {
+                    x.replaceTrack(null);
+                }
+            }
+        })
+
+        screenStream.getTracks().forEach(x => {
+            x.stop();
+        });
+
+        const inputVideo = document.getElementById('call-input-video');
+        if (inputVideo) {
+            inputVideo.srcObject = inputStream;
+        }
+
+        currentCall.screenStream = null;
+    }
+
+    p2pCloseConnectionAndStream(connection, inputStream, outputStream, screenStream) {
+        LOG_P2P_CALL('[conn] p2pCloseConnectionAndStream', connection, inputStream, outputStream);
+        try {
+            if (outputStream) {
+                outputStream.getTracks().forEach(t => {
+                    t.stop();
+                });
+            }
+        } catch (e) {
+            LOG_P2P_CALL('hangUp error 0', e);
+        }
+
+        try {
+            if (inputStream) {
+                inputStream.getTracks().forEach(t => {
+                    t.stop();
+                })
+            }
+        } catch (e) {
+            LOG_P2P_CALL('hangUp error 1', e);
+        }
+
+        try {
+            if (screenStream) {
+                screenStream.getTracks().forEach(t => {
+                    t.stop();
+                })
+            }
+        } catch (e) {
+            LOG_P2P_CALL('hangUp error 2', e);
+        }
+
+        try {
+            if (connection) {
+                connection.close();
+            }
+        } catch (e) {
+            LOG_P2P_CALL('hangUp error 3', e);
+        }
+    }
+
+    p2pAudioEnabled(enabled) {
+        const { currentCall } = this;
+        if (!currentCall) return;
+
+        const { connection } = currentCall;
+        if (!connection) return;
+
+        const senders = connection.getSenders();
+        senders.forEach(x => {
+            const { track } = x;
+            if (track && track.kind === 'audio') {
+                track.enabled = enabled;
+            }
+        });
+    }
+
+    p2pVideoEnabled(enabled) {
+        const { currentCall } = this;
+        if (!currentCall) return;
+
+        const { connection } = currentCall;
+        if (!connection) return;
+
+        const senders = connection.getSenders();
+        senders.forEach(x => {
+            const { track } = x;
+            if (track && track.kind === 'video') {
+                track.enabled = enabled;
+            }
         });
     }
 }

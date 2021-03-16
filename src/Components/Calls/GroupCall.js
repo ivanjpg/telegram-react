@@ -15,7 +15,6 @@ import { closeGroupCallPanel } from '../../Actions/Call';
 import { modalManager } from '../../Utils/Modal';
 import { PIP_PLAYER_BORDER_PRECISION } from '../../Constants';
 import CallStore from '../../Stores/CallStore';
-import TdLibController from '../../Controllers/TdLibController';
 import './GroupCall.css';
 
 class GroupCall extends React.Component {
