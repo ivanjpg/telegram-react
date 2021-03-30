@@ -13,6 +13,7 @@ import { getUserFullName } from '../Utils/User';
 import { fromTelegramSource, getStream, getTransport, parseSdp, toTelegramSource } from '../Calls/Utils';
 import { showAlert, showLeaveVoiceChatAlert } from '../Actions/Client';
 import { throttle } from '../Utils/Common';
+import { p2pParseSdp, P2PSdpBuilder } from '../Calls/P2P/P2PSdpBuilder';
 import { GROUP_CALL_AMPLITUDE_ANALYSE_INTERVAL_MS, GROUP_CALL_PARTICIPANTS_LOAD_LIMIT } from '../Constants';
 import AppStore from './ApplicationStore';
 import LStore from './LocalizationStore';
@@ -20,6 +21,7 @@ import UserStore from './UserStore';
 import TdLibController from '../Controllers/TdLibController';
 
 const JOIN_TRACKS = true;
+const UNIFY_SDP = true;
 
 export function LOG_CALL(str, ...data) {
     // return;
@@ -100,13 +102,24 @@ class CallStore extends EventEmitter {
                     if (call) {
                         switch (state['@type']) {
                             case 'callStateDiscarded': {
-                                // if (!is_outgoing) {
-                                    closeCallPanel();
-                                // }
+                                closeCallPanel();
                                 this.p2pHangUp(id);
                                 break;
                             }
                             case 'callStateError': {
+                                const { error } = state;
+                                if (error) {
+                                    const { code, message } = error;
+                                    if (code === 403 && message === 'USER_PRIVACY_RESTRICTED') {
+                                        const { user_id } = call;
+                                        showAlert({
+                                            title: LStore.getString('VoipFailed'),
+                                            message: LStore.replaceTags(LStore.formatString('CallNotAvailable', getUserFullName(user_id, null))),
+                                            ok: LStore.getString('OK')
+                                        });
+                                    }
+                                }
+
                                 closeCallPanel();
                                 this.p2pHangUp(id);
                                 break;
@@ -115,6 +128,7 @@ class CallStore extends EventEmitter {
                                 break;
                             }
                             case 'callStateHangingUp': {
+                                closeCallPanel();
                                 break;
                             }
                             case 'callStatePending': {
@@ -319,6 +333,10 @@ class CallStore extends EventEmitter {
                 this.emit('clientUpdateCallPanel', update);
                 break;
             }
+            case 'clientUpdateCallMediaIsMuted': {
+                this.emit('clientUpdateCallMediaIsMuted', update);
+                break;
+            }
             default:
                 break;
         }
@@ -443,9 +461,31 @@ class CallStore extends EventEmitter {
     }
 
     async startGroupCall(chatId) {
-        let { currentGroupCall } = this;
-        LOG_CALL('startGroupCall', currentGroupCall);
-        if (currentGroupCall) {
+        let { currentCall, currentGroupCall } = this;
+        LOG_CALL('startGroupCall', currentCall, currentGroupCall);
+        if (currentCall) {
+            const { callId } = currentCall;
+            const call = this.p2pGet(callId);
+            if (call) {
+                showAlert({
+                    title: LStore.getString('VoipOngoingAlertTitle'),
+                    message: LStore.replaceTags(LStore.formatString('VoipOngoingAlert2', getUserFullName(call.user_id, null), getChatTitle(chatId))),
+                    ok: LStore.getString('OK'),
+                    cancel: LStore.getString('Cancel'),
+                    onResult: async result => {
+                        if (result) {
+                            currentCall = this.currentCall;
+                            if (currentCall) {
+                                await this.p2pHangUp(currentCall.callId, true);
+                            }
+                            await this.startGroupCallInternal(chatId);
+                        }
+                    }
+                });
+            }
+
+            return;
+        } else if (currentGroupCall) {
             const { chatId: oldChatId } = currentGroupCall;
 
             showAlert({
@@ -492,7 +532,7 @@ class CallStore extends EventEmitter {
             TdLibController.send({ '@type': 'getGroupCall', group_call_id: groupCallId });
         }
 
-        let { currentGroupCall } = this;
+        let { currentGroupCall, currentCall } = this;
         let streamManager = null;
         try {
             if (rejoin) {
@@ -517,27 +557,53 @@ class CallStore extends EventEmitter {
         }
         if (!streamManager || !streamManager.inputStream) return;
 
-        LOG_CALL('joinGroupCall has another', groupCallId, currentGroupCall);
-        if (currentGroupCall && !rejoin) {
-            const { chatId: oldChatId } = currentGroupCall;
+        LOG_CALL('joinGroupCall has another', groupCallId, currentCall, currentGroupCall);
+        if (!rejoin) {
+            if (currentCall) {
+                const { callId } = currentCall;
+                const call = this.p2pGet(callId);
+                if (call) {
+                    const { user_id } = call;
 
-            showAlert({
-                title: LStore.getString('VoipOngoingChatAlertTitle'),
-                message: LStore.replaceTags(LStore.formatString('VoipOngoingChatAlert', getChatTitle(oldChatId), getChatTitle(chatId))),
-                ok: LStore.getString('OK'),
-                cancel: LStore.getString('Cancel'),
-                onResult: async result => {
-                    if (result) {
-                        currentGroupCall = this.currentGroupCall;
-                        if (currentGroupCall) {
-                            this.hangUp(currentGroupCall.groupCallId);
+                    showAlert({
+                        title: LStore.getString('VoipOngoingAlertTitle'),
+                        message: LStore.replaceTags(LStore.formatString('VoipOngoingAlert2', getUserFullName(user_id, null), getChatTitle(chatId))),
+                        ok: LStore.getString('OK'),
+                        cancel: LStore.getString('Cancel'),
+                        onResult: async result => {
+                            if (result) {
+                                currentCall = this.currentCall;
+                                if (currentCall) {
+                                    this.p2pHangUp(currentCall.callId, true);
+                                }
+                                this.joinGroupCallInternal(chatId, groupCallId, streamManager, muted, rejoin);
+                            }
                         }
-                        this.joinGroupCallInternal(chatId, groupCallId, streamManager, muted, rejoin);
-                    }
-                }
-            });
+                    });
 
-            return;
+                    return;
+                }
+            } else if (currentGroupCall) {
+                const { chatId: oldChatId } = currentGroupCall;
+
+                showAlert({
+                    title: LStore.getString('VoipOngoingChatAlertTitle'),
+                    message: LStore.replaceTags(LStore.formatString('VoipOngoingChatAlert', getChatTitle(oldChatId), getChatTitle(chatId))),
+                    ok: LStore.getString('OK'),
+                    cancel: LStore.getString('Cancel'),
+                    onResult: async result => {
+                        if (result) {
+                            currentGroupCall = this.currentGroupCall;
+                            if (currentGroupCall) {
+                                this.hangUp(currentGroupCall.groupCallId);
+                            }
+                            this.joinGroupCallInternal(chatId, groupCallId, streamManager, muted, rejoin);
+                        }
+                    }
+                });
+
+                return;
+            }
         }
 
         await this.joinGroupCallInternal(chatId, groupCallId, streamManager, muted, rejoin);
@@ -1427,21 +1493,132 @@ class CallStore extends EventEmitter {
         };
     }
 
-    p2pStartCall(userId, isVideo) {
+    async p2pStartCall(userId, isVideo) {
         LOG_P2P_CALL('p2pStartCall', userId, isVideo);
 
+        let { currentCall, currentGroupCall } = this;
+        if (currentCall) {
+            const { callId } = currentCall;
+            const call = this.p2pGet(callId);
+            if (call) {
+                showAlert({
+                    title: LStore.getString('VoipOngoingAlertTitle'),
+                    message: LStore.replaceTags(LStore.formatString('VoipOngoingAlert', getUserFullName(call.user_id, null), getUserFullName(userId, null))),
+                    ok: LStore.getString('OK'),
+                    cancel: LStore.getString('Cancel'),
+                    onResult: async result => {
+                        if (result) {
+                            currentCall = this.currentCall;
+                            if (currentCall) {
+                                await this.p2pHangUp(currentCall.callId, true);
+                            }
+                            await this.p2pStartCallInternal(userId, isVideo);
+                        }
+                    }
+                });
+            }
+
+            return;
+        } else if (currentGroupCall) {
+            const { chatId: oldChatId } = currentGroupCall;
+
+            showAlert({
+                title: LStore.getString('VoipOngoingChatAlertTitle'),
+                message: LStore.replaceTags(LStore.formatString('VoipOngoingChatAlert2', getChatTitle(oldChatId), getUserFullName(userId, null))),
+                ok: LStore.getString('OK'),
+                cancel: LStore.getString('Cancel'),
+                onResult: async result => {
+                    if (result) {
+                        currentGroupCall = this.currentGroupCall;
+                        if (currentGroupCall) {
+                            await this.hangUp(currentGroupCall.groupCallId);
+                        }
+                        await this.p2pStartCallInternal(userId, isVideo);
+                    }
+                }
+            });
+
+            return;
+        }
+
+        await this.p2pStartCallInternal(userId, isVideo);
+    }
+
+    p2pStartCallInternal(userId, isVideo) {
+        LOG_P2P_CALL('p2pStartCallInternal', userId, isVideo);
+
+        const fullInfo = UserStore.getFullInfo(userId);
+        if (!fullInfo) return;
+
+        const { can_be_called, has_private_calls, supports_video_calls } = fullInfo;
+        LOG_P2P_CALL('p2pStartCallInternal fullInfo', fullInfo, can_be_called, has_private_calls, supports_video_calls);
+
         const protocol = this.p2pGetProtocol();
-        LOG_P2P_CALL('[tdlib] createCall', userId, protocol, isVideo);
+        LOG_P2P_CALL('[tdlib] createCall', userId, protocol, isVideo, supports_video_calls);
         TdLibController.send({
             '@type': 'createCall',
             user_id: userId,
             protocol,
-            is_video: isVideo
+            is_video: isVideo && supports_video_calls
         });
     }
 
     p2pAcceptCall(callId) {
         LOG_P2P_CALL('p2pAcceptCall', callId);
+
+        const call = this.p2pGet(callId);
+        if (!call) return;
+
+        let { currentCall, currentGroupCall } = this;
+        if (currentCall) {
+            const { callId: prevCallId } = currentCall;
+            const prevCall = this.p2pGet(prevCallId);
+            if (prevCall) {
+                showAlert({
+                    title: LStore.getString('VoipOngoingAlertTitle'),
+                    message: LStore.replaceTags(LStore.formatString('VoipOngoingAlert', getUserFullName(prevCall.user_id, null), getUserFullName(call.user_id, null))),
+                    ok: LStore.getString('OK'),
+                    cancel: LStore.getString('Cancel'),
+                    onResult: async result => {
+                        if (result) {
+                            currentCall = this.currentCall;
+                            if (currentCall) {
+                                await this.p2pHangUp(currentCall.callId, true);
+                            }
+                            await this.p2pAcceptCallInternal(callId);
+                        }
+                    }
+                });
+
+                return;
+            }
+        } else if (currentGroupCall) {
+            const { chatId: oldChatId } = currentGroupCall;
+
+            showAlert({
+                title: LStore.getString('VoipOngoingChatAlertTitle'),
+                message: LStore.replaceTags(LStore.formatString('VoipOngoingChatAlert2', getChatTitle(oldChatId), getUserFullName(call.user_id, null))),
+                ok: LStore.getString('OK'),
+                cancel: LStore.getString('Cancel'),
+                onResult: async result => {
+                    if (result) {
+                        currentGroupCall = this.currentGroupCall;
+                        if (currentGroupCall) {
+                            await this.hangUp(currentGroupCall.groupCallId);
+                        }
+                        await this.p2pAcceptCallInternal(callId);
+                    }
+                }
+            });
+
+            return;
+        }
+
+        this.p2pAcceptCallInternal(callId);
+    }
+
+    async p2pAcceptCallInternal(callId) {
+        LOG_P2P_CALL('p2pAcceptCallInternal', callId);
 
         const protocol = this.p2pGetProtocol();
         LOG_P2P_CALL('[tdlib] acceptCall', callId, protocol);
@@ -1449,20 +1626,6 @@ class CallStore extends EventEmitter {
             '@type': 'acceptCall',
             call_id: callId,
             protocol
-        });
-    }
-
-    p2pDiscardCall(callId, isDisconnected, duration, isVideo, connectionId) {
-        LOG_P2P_CALL('p2pDiscardCall', callId);
-
-        LOG_P2P_CALL('[tdlib] discardCall', callId, isDisconnected, duration, isVideo, connectionId);
-        TdLibController.send({
-            '@type': 'discardCall',
-            call_id: callId,
-            is_disconnected: isDisconnected,
-            duration,
-            is_video: isVideo,
-            connection_id: connectionId
         });
     }
 
@@ -1527,6 +1690,7 @@ class CallStore extends EventEmitter {
 
     async p2pJoinCall(callId) {
         LOG_P2P_CALL('p2pJoinCall', callId);
+
         const call = this.p2pGet(callId);
         if (!call) return;
 
@@ -1563,6 +1727,13 @@ class CallStore extends EventEmitter {
             if (video) {
                 video.srcObject = outputStream;
             }
+
+            track.onmute = () => {
+                LOG_P2P_CALL('[track] onmute', track);
+            };
+            track.onunmute = () => {
+                LOG_P2P_CALL('[track] onunmute', track);
+            };
         };
 
         this.currentCall = {
@@ -1621,7 +1792,7 @@ class CallStore extends EventEmitter {
         });
 
         await connection.setLocalDescription(offer);
-        this.p2pSendOffer(callId, offer);
+        this.p2pSendSdp(callId, offer);
     };
 
     p2pAppendInputStream(inputStream) {
@@ -1668,11 +1839,21 @@ class CallStore extends EventEmitter {
 
         const { is_outgoing } = call;
 
-        const { type, data } = signalingData;
+        const { type } = signalingData;
         switch (type) {
             case 'answer':
             case 'offer':{
-                await connection.setRemoteDescription(signalingData);
+                let description = signalingData;
+                if (UNIFY_SDP) {
+                    description = {
+                        type,
+                        sdp: type === 'offer' ?
+                            P2PSdpBuilder.generateOffer(signalingData) :
+                            P2PSdpBuilder.generateAnswer(signalingData)
+                    }
+                }
+
+                await connection.setRemoteDescription(description);
                 if (currentCall.candidates) {
                     currentCall.candidates.forEach(x => {
                         connection.addIceCandidate(x);
@@ -1690,60 +1871,89 @@ class CallStore extends EventEmitter {
                         this.p2pAppendInputStream(inputStream);
                     }
 
-                    this.p2pSendAnswer(callId, answer);
+                    this.p2pSendSdp(callId, answer);
                 }
                 break;
             }
             case 'candidate': {
-                const candidate = new RTCIceCandidate(data);
-                if (candidate.candidate) {
+                const { candidate, sdpMLineIndex, sdpMid } = signalingData;
+                if (candidate) {
+                    const iceCandidate = new RTCIceCandidate({ candidate, sdpMLineIndex, sdpMid });
                     if (!connection.remoteDescription) {
                         currentCall.candidates = currentCall.candidates || [];
-                        currentCall.candidates.push(candidate);
+                        currentCall.candidates.push(iceCandidate);
                     } else {
-                        await connection.addIceCandidate(candidate);
+                        await connection.addIceCandidate(iceCandidate);
                     }
                 }
+                break;
+            }
+            case 'media': {
+                const { kind, isMuted } = signalingData;
+                if (kind === 'audio') {
+                    currentCall.audioIsMuted = isMuted;
+                } else if (kind === 'video') {
+                    currentCall.videoIsMuted = isMuted;
+                }
+
+                TdLibController.clientUpdate({
+                    '@type': 'clientUpdateCallMediaIsMuted',
+                    callId,
+                    kind,
+                    isMuted
+                });
+
                 break;
             }
         }
     }
 
-    p2pSendIceCandidate(callId, candidate) {
-        LOG_P2P_CALL('p2pSendIceCandidate', callId, candidate);
-        this.p2pSendCallSignalingData(callId, JSON.stringify({ type: 'candidate', data: candidate.toJSON() }));
+    p2pSendMediaIsMuted(callId, kind, isMuted) {
+        LOG_P2P_CALL('p2pSendMediaIsMuted', callId, kind, isMuted);
+        this.p2pSendCallSignalingData(callId, JSON.stringify({ type: 'media', kind, isMuted }));
     }
 
-    p2pSendDescription(callId, description) {
-        LOG_P2P_CALL('p2pSendDescription', callId, description);
-        this.p2pSendCallSignalingData(callId, JSON.stringify(description));
+    p2pSendIceCandidate(callId, iceCandidate) {
+        LOG_P2P_CALL('p2pSendIceCandidate', callId, iceCandidate);
+        const { candidate, sdpMLineIndex, sdpMid } = iceCandidate;
+        this.p2pSendCallSignalingData(callId, JSON.stringify({ type: 'candidate', candidate, sdpMLineIndex, sdpMid }));
     }
 
-    p2pSendOffer(callId, offer) {
-        LOG_P2P_CALL('p2pSendOffer', callId, offer);
-        this.p2pSendCallSignalingData(callId, JSON.stringify(offer));
-        // this.p2pSendCallSignalingData(callId, JSON.stringify({ type: 'offer', data: offer }));
+    p2pSendSdp(callId, sdpData) {
+        LOG_P2P_CALL('p2pSendSdp', callId, sdpData);
+        if (UNIFY_SDP) {
+            const { type, sdp } = sdpData;
+            const sdpInfo = p2pParseSdp(sdp);
+            sdpInfo.type = type;
+            // sdpInfo.sdp = sdp;
+
+            this.p2pSendCallSignalingData(callId, JSON.stringify(sdpInfo));
+        } else {
+            this.p2pSendCallSignalingData(callId, JSON.stringify(sdpData));
+        }
     }
 
-    p2pSendAnswer(callId, answer) {
-        LOG_P2P_CALL('p2pSendAnswer', callId, answer);
-        this.p2pSendCallSignalingData(callId, JSON.stringify(answer));
-        // this.p2pSendCallSignalingData(callId, JSON.stringify({ type: 'answer', data: answer }));
-    }
-
-    p2pHangUp(callId) {
-        LOG_P2P_CALL('hangUp', callId);
+    p2pHangUp(callId, discard = false) {
         const { currentCall } = this;
-        if (!currentCall) return;
-        if (currentCall.callId !== callId) return;
+        LOG_P2P_CALL('hangUp', callId, currentCall);
+        if (currentCall && currentCall.callId === callId) {
+            const { connection, inputStream, outputStream, screenStream } = currentCall;
+            this.p2pCloseConnectionAndStream(connection, inputStream, outputStream, screenStream);
 
-        const call = this.get(callId);
-        if (call) return;
+            this.currentCall = null;
+        }
 
-        const { connection, inputStream, outputStream, screenStream } = currentCall;
-        this.p2pCloseConnectionAndStream(connection, inputStream, outputStream, screenStream);
-
-        this.currentCall = null;
+        if (discard) {
+            LOG_P2P_CALL('[tdlib] discardCall', callId);
+            TdLibController.send({
+                '@type': 'discardCall',
+                call_id: callId,
+                is_disconnected: false,
+                duration: 0,
+                is_video: false,
+                connection_id: 0
+            });
+        }
     }
 
     async p2pStartScreenSharing() {
@@ -1857,7 +2067,7 @@ class CallStore extends EventEmitter {
         const { currentCall } = this;
         if (!currentCall) return;
 
-        const { connection } = currentCall;
+        const { connection, callId } = currentCall;
         if (!connection) return;
 
         const senders = connection.getSenders();
@@ -1867,13 +2077,15 @@ class CallStore extends EventEmitter {
                 track.enabled = enabled;
             }
         });
+
+        this.p2pSendMediaIsMuted(callId, 'audio', !enabled);
     }
 
     p2pVideoEnabled(enabled) {
         const { currentCall } = this;
         if (!currentCall) return;
 
-        const { connection } = currentCall;
+        const { connection, callId } = currentCall;
         if (!connection) return;
 
         const senders = connection.getSenders();
@@ -1883,6 +2095,8 @@ class CallStore extends EventEmitter {
                 track.enabled = enabled;
             }
         });
+
+        this.p2pSendMediaIsMuted(callId, 'video', !enabled);
     }
 }
 
