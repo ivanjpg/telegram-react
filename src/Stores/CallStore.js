@@ -13,7 +13,7 @@ import { getUserFullName } from '../Utils/User';
 import { fromTelegramSource, getStream, getTransport, parseSdp, toTelegramSource } from '../Calls/Utils';
 import { showAlert, showLeaveVoiceChatAlert } from '../Actions/Client';
 import { throttle } from '../Utils/Common';
-import { p2pParseSdp, P2PSdpBuilder } from '../Calls/P2P/P2PSdpBuilder';
+import { p2pParseCandidate, p2pParseSdp, P2PSdpBuilder } from '../Calls/P2P/P2PSdpBuilder';
 import { GROUP_CALL_AMPLITUDE_ANALYSE_INTERVAL_MS, GROUP_CALL_PARTICIPANTS_LOAD_LIMIT } from '../Constants';
 import AppStore from './ApplicationStore';
 import LStore from './LocalizationStore';
@@ -22,6 +22,8 @@ import TdLibController from '../Controllers/TdLibController';
 
 const JOIN_TRACKS = true;
 const UNIFY_SDP = true;
+const UNIFY_CANDIDATE = true;
+const DATACHANNEL = true;
 
 export function LOG_CALL(str, ...data) {
     // return;
@@ -1688,6 +1690,24 @@ class CallStore extends EventEmitter {
         };
     }
 
+    p2pCreateChannel(connection) {
+        if (DATACHANNEL) {
+            const channel = connection.createDataChannel('data', {
+                id: 0,
+                negotiated: true
+            });
+            channel.onmessage = e => {
+                LOG_P2P_CALL('[channel] onmessage', e);
+                const { data } = e;
+                this.p2pApplyCallDataChannelData(JSON.parse(data));
+            };
+
+            return channel;
+        }
+
+        return null;
+    }
+
     async p2pJoinCall(callId) {
         LOG_P2P_CALL('p2pJoinCall', callId);
 
@@ -1745,10 +1765,6 @@ class CallStore extends EventEmitter {
         LOG_P2P_CALL('p2pJoinCall currentCall', this.currentCall);
 
         const inputStream = await navigator.mediaDevices.getUserMedia({
-            // video: {
-            //     width: { min: 270, max: 270 },
-            //     height: { min: 480, max: 480},
-            // },
             video: true,
             audio: true
         });
@@ -1803,6 +1819,10 @@ class CallStore extends EventEmitter {
         const { connection } = currentCall;
         if (!connection) return;
 
+        if (DATACHANNEL) {
+            currentCall.channel = this.p2pCreateChannel(connection);
+        }
+
         const senders = connection.getSenders();
         if (senders.some(x => x.track)) return;
 
@@ -1812,11 +1832,45 @@ class CallStore extends EventEmitter {
         LOG_P2P_CALL('p2pAppendInputStream stop', inputStream);
     }
 
-    async p2pApplyCallSignalingData(callId, signalingData) {
-        if (!signalingData) return;
+    async p2pApplyCallDataChannelData(data) {
+        if (!data) return;
 
         const { currentCall } = this;
-        LOG_P2P_CALL('p2pApplyCallSignalingData', currentCall, signalingData);
+        LOG_P2P_CALL('p2pApplyCallDataChannelData', currentCall, data);
+        if (!currentCall) {
+            ERROR_P2P_CALL('p2pApplyCallDataChannelData 0');
+            return;
+        }
+
+        const { callId } = currentCall;
+
+        const { type } = data;
+        switch (type) {
+            case 'media': {
+                const { kind, isMuted } = data;
+                if (kind === 'audio') {
+                    currentCall.audioIsMuted = isMuted;
+                } else if (kind === 'video') {
+                    currentCall.videoIsMuted = isMuted;
+                }
+
+                TdLibController.clientUpdate({
+                    '@type': 'clientUpdateCallMediaIsMuted',
+                    callId,
+                    kind,
+                    isMuted
+                });
+
+                break;
+            }
+        }
+    }
+
+    async p2pApplyCallSignalingData(callId, data) {
+        if (!data) return;
+
+        const { currentCall } = this;
+        LOG_P2P_CALL('p2pApplyCallSignalingData', currentCall, data);
         if (!currentCall) {
             ERROR_P2P_CALL('p2pApplyCallSignalingData 0');
             return;
@@ -1839,23 +1893,24 @@ class CallStore extends EventEmitter {
 
         const { is_outgoing } = call;
 
-        const { type } = signalingData;
+        const { type } = data;
         switch (type) {
             case 'answer':
             case 'offer':{
-                let description = signalingData;
+                let description = data;
                 if (UNIFY_SDP) {
                     description = {
                         type,
                         sdp: type === 'offer' ?
-                            P2PSdpBuilder.generateOffer(signalingData) :
-                            P2PSdpBuilder.generateAnswer(signalingData)
+                            P2PSdpBuilder.generateOffer(data) :
+                            P2PSdpBuilder.generateAnswer(data)
                     }
                 }
-
+                LOG_P2P_CALL('[generate] ', data, description.type, description.sdp);
                 await connection.setRemoteDescription(description);
                 if (currentCall.candidates) {
                     currentCall.candidates.forEach(x => {
+                        LOG_P2P_CALL('[candidate] add postpone', x);
                         connection.addIceCandidate(x);
                     });
                     currentCall.candidates = [];
@@ -1876,20 +1931,27 @@ class CallStore extends EventEmitter {
                 break;
             }
             case 'candidate': {
-                const { candidate, sdpMLineIndex, sdpMid } = signalingData;
+                let candidate = data;
+                if (UNIFY_CANDIDATE) {
+                    candidate = P2PSdpBuilder.generateCandidate(candidate.candidate);
+                    candidate.sdpMLineIndex = data.sdpMLineIndex;
+                    candidate.sdpMid = data.sdpMid;
+                }
                 if (candidate) {
-                    const iceCandidate = new RTCIceCandidate({ candidate, sdpMLineIndex, sdpMid });
+                    const iceCandidate = new RTCIceCandidate(candidate);
                     if (!connection.remoteDescription) {
                         currentCall.candidates = currentCall.candidates || [];
+                        LOG_P2P_CALL('[candidate] postpone', iceCandidate);
                         currentCall.candidates.push(iceCandidate);
                     } else {
+                        LOG_P2P_CALL('[candidate] add', iceCandidate);
                         await connection.addIceCandidate(iceCandidate);
                     }
                 }
                 break;
             }
             case 'media': {
-                const { kind, isMuted } = signalingData;
+                const { kind, isMuted } = data;
                 if (kind === 'audio') {
                     currentCall.audioIsMuted = isMuted;
                 } else if (kind === 'video') {
@@ -1908,15 +1970,36 @@ class CallStore extends EventEmitter {
         }
     }
 
+    p2pSendDataChannelData(data) {
+        const { currentCall } = this;
+        if (!currentCall) return;
+
+        const { channel } = currentCall;
+        if (!channel) return;
+
+        channel.send(data);
+    }
+
     p2pSendMediaIsMuted(callId, kind, isMuted) {
         LOG_P2P_CALL('p2pSendMediaIsMuted', callId, kind, isMuted);
-        this.p2pSendCallSignalingData(callId, JSON.stringify({ type: 'media', kind, isMuted }));
+
+        if (DATACHANNEL) {
+            this.p2pSendDataChannelData(JSON.stringify({ type: 'media', kind, isMuted }));
+        } else {
+            this.p2pSendCallSignalingData(callId, JSON.stringify({ type: 'media', kind, isMuted }));
+        }
     }
 
     p2pSendIceCandidate(callId, iceCandidate) {
         LOG_P2P_CALL('p2pSendIceCandidate', callId, iceCandidate);
-        const { candidate, sdpMLineIndex, sdpMid } = iceCandidate;
-        this.p2pSendCallSignalingData(callId, JSON.stringify({ type: 'candidate', candidate, sdpMLineIndex, sdpMid }));
+        if (UNIFY_CANDIDATE) {
+            let { candidate, sdpMLineIndex, sdpMid } = iceCandidate;
+            candidate = p2pParseCandidate(candidate);
+            this.p2pSendCallSignalingData(callId, JSON.stringify({ type: 'candidate', candidate, sdpMLineIndex, sdpMid }));
+        } else {
+            const { candidate, sdpMLineIndex, sdpMid } = iceCandidate;
+            this.p2pSendCallSignalingData(callId, JSON.stringify({ type: 'candidate', candidate, sdpMLineIndex, sdpMid }));
+        }
     }
 
     p2pSendSdp(callId, sdpData) {

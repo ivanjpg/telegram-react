@@ -9,25 +9,43 @@ import {addExtmap, addPayloadTypes, addSsrc} from './P2PSdpBuilder';
 
 export class ChromeP2PSdpBuilder {
     static generateOffer(info) {
-        const { sessionId, hash, fingerprint, media } = info;
+        const { sessionId, fingerprints, media } = info;
 
         let sdp = `v=0
 o=- ${sessionId} 2 IN IP4 127.0.0.1
 s=-
 t=0 0`;
-        if (hash && fingerprint) {
-            sdp += `
-a=fingerprint:${hash} ${fingerprint}`;
+        if (fingerprints) {
+            fingerprints.forEach(x => {
+                const { hash, fingerprint, setup } = x;
+                sdp += `
+a=fingerprint:${hash} ${fingerprint}
+a=setup:${setup}`;
+            });
         }
+
         sdp += `
 a=group:BUNDLE ${media.map(x => x.mid).join(' ')}
 a=extmap-allow-mixed
-a=msid-semantic: WMS`;
+a=msid-semantic: WMS *`;
         const streamName = 'stream' + media.map(x => x.ssrc).join('_');
         for (let i = 0; i < media.length; i++) {
             const m = media[i];
-            const { type, ssrc, ssrcGroup, types, ufrag, pwd, hash, fingerprint, setup, dir, mid, extmap } = m;
+            const { type, ssrc, ssrcGroup, types, ufrag, pwd, dir, mid, extmap } = m;
             switch (type) {
+                case 'application': {
+                    const { port, maxSize } = m;
+                    sdp += `
+m=application 9 UDP/DTLS/SCTP webrtc-datachannel
+c=IN IP4 0.0.0.0
+a=ice-ufrag:${ufrag}
+a=ice-pwd:${pwd}
+a=ice-options:trickle
+a=mid:${mid}
+a=sctp-port:${port}
+a=max-message-size:${maxSize}`;
+                    break;
+                }
                 case 'audio': {
                     sdp += `
 m=audio 56930 UDP/TLS/RTP/SAVPF ${types.map(x => x.id).join(' ')}
@@ -36,8 +54,6 @@ a=rtcp:9 IN IP4 0.0.0.0
 a=ice-ufrag:${ufrag}
 a=ice-pwd:${pwd}
 a=ice-options:trickle
-a=fingerprint:${hash} ${fingerprint}
-a=setup:${setup}
 a=mid:${mid}`;
                     sdp += addExtmap(extmap);
                     if (dir) {
@@ -63,8 +79,6 @@ a=rtcp:9 IN IP4 0.0.0.0
 a=ice-ufrag:${ufrag}
 a=ice-pwd:${pwd}
 a=ice-options:trickle
-a=fingerprint:${hash} ${fingerprint}
-a=setup:${setup}
 a=mid:${mid}`;
                     sdp += addExtmap(extmap);
                     if (dir) {
@@ -91,25 +105,42 @@ a=rtcp-rsize`;
     }
 
     static generateAnswer(info) {
-        const { sessionId, hash, fingerprint, media } = info;
+        const { sessionId, fingerprints, media } = info;
 
         let sdp = `v=0
 o=- ${sessionId} 2 IN IP4 127.0.0.1
 s=-
 t=0 0`;
-        if (hash && fingerprint) {
-            sdp += `
-a=fingerprint:${hash} ${fingerprint}`;
+        if (fingerprints) {
+            fingerprints.forEach(x => {
+                const { hash, fingerprint, setup } = x;
+                sdp += `
+a=fingerprint:${hash} ${fingerprint}
+a=setup:${setup}`;
+            });
         }
         sdp += `
 a=group:BUNDLE ${media.map(x => x.mid).join(' ')}
 a=extmap-allow-mixed
-a=msid-semantic: WMS`;
+a=msid-semantic: WMS *`;
         const streamName = 'stream' + media.map(x => x.ssrc).join('_');
         for (let i = 0; i < media.length; i++) {
             const m = media[i];
-            const { type, mid, ssrc, ssrcGroup, types, ufrag, pwd, hash, fingerprint, setup, dir, extmap } = m;
+            const { type, mid, ssrc, ssrcGroup, types, ufrag, pwd, dir, extmap } = m;
             switch (type) {
+                case 'application': {
+                    const { port, maxSize } = m;
+                    sdp += `
+m=application 9 UDP/DTLS/SCTP webrtc-datachannel
+c=IN IP4 0.0.0.0
+a=ice-ufrag:${ufrag}
+a=ice-pwd:${pwd}
+a=ice-options:trickle
+a=mid:${mid}
+a=sctp-port:${port}
+a=max-message-size:${maxSize}`;
+                    break;
+                }
                 case 'audio': {
                     sdp += `
 m=audio 56930 UDP/TLS/RTP/SAVPF ${types.map(x => x.id).join(' ')}
@@ -118,8 +149,6 @@ a=rtcp:9 IN IP4 0.0.0.0
 a=ice-ufrag:${ufrag}
 a=ice-pwd:${pwd}
 a=ice-options:trickle
-a=fingerprint:${hash} ${fingerprint}
-a=setup:${setup}
 a=mid:${mid}`;
                     sdp += addExtmap(extmap);
                     if (dir) {
@@ -144,8 +173,6 @@ a=rtcp:9 IN IP4 0.0.0.0
 a=ice-ufrag:${ufrag}
 a=ice-pwd:${pwd}
 a=ice-options:trickle
-a=fingerprint:${hash} ${fingerprint}
-a=setup:${setup}
 a=mid:${mid}`;
                     sdp += addExtmap(extmap);
                     if (dir) {
